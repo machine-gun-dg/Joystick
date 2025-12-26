@@ -1,25 +1,21 @@
-//START SERVER********************************************
 #include <esp_now.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
 // !! SOSTITUISCI CON IL MAC ADDRESS REALE DEL TUO SLAVE !!
-// Esempio: {0x1C, 0xDB, 0xD4, 0x5A, 0xC3, 0x68}
 uint8_t slaveAddress[] = {0x1C, 0xDB, 0xD4, 0x5A, 0xC3, 0x68}; 
 // -- Inclusione delle definizioni (Sezione 1) --
 enum Direction { NORD, EST, SUD, OVEST, INVALID_DIRECTION };
 typedef struct struct_message { Direction direction; } struct_message;
-const char* directionNames[] = {"NORD", "EST", "SUD", "OVEST"};
+const char* directionNames[] = {"NORD", "EST", "SUD", "OVEST", "INVALID_DIRECTION"};
 // ----------------------------------------------
 
 struct_message myData;
 esp_now_peer_info_t peerInfo;
-int directionIndex = 0;
- 
-
-//END SERVER}*********************************************
+// Non usiamo più directionIndex per cicli fixed
+// int directionIndex = 0; 
 
 // =======================================================
-// CONFIGURAZIONE PIN E CALIBRAZIONE (DA MODIFICARE)
+// CONFIGURAZIONE PIN E CALIBRAZIONE
 // =======================================================
 const int joyX = 1; // VRx - Analog input per l'asse X (Sterzo / Direzione)
 const int joyY = 2; // VRy - Analog input per l'asse Y (Accelerazione / Marcia)
@@ -37,23 +33,28 @@ const int CENTER_X_REAL = 1750; // Il centro X reale (Sterzo)
 const int DEADZONE = 100; // Zona morta: es. 1750 +/- 100
 const int STEP_PERCENT = 10; // Arrotonda al multiplo di 10%
 
+// Variabile per evitare di inviare lo stesso messaggio più volte
+Direction lastSentDirection = INVALID_DIRECTION;
+
 // =======================================================
 // FUNZIONE DI INIZIALIZZAZIONE (ESEGUITA 1 VOLTA)
 // =======================================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("--- Mappatura 10% (INVERTITA) ---");
+  Serial.println("--- Joystick Master (ESP-NOW) ---");
   Serial.println("Centro Y calibrato: " + String(CENTER_Y_REAL));
   
   pinMode(buttonPin, INPUT_PULLUP);
-//START SERVER********************************************
-WiFi.mode(WIFI_STA);
+  
+  // START SERVER CONFIGURATION
+  WiFi.mode(WIFI_STA);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
     return;
   }
   
+  // Registrazione della callback di invio corretta
   esp_now_register_send_cb(OnDataSent);
   
   // Registra il peer (lo Slave)
@@ -66,16 +67,12 @@ WiFi.mode(WIFI_STA);
     return;
   }
   Serial.println("ESP-NOW Master Ready to send directions...");
-//END SERVER}*********************************************
-
 }
 
-
-//START SERVER********************************************
+// START SERVER CALLBACK
+// Callback per notificare se il pacchetto è stato inviato con successo
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
-  
-  // *** CORREZIONE DEFINITIVA: USA src_addr come suggerito dal compilatore ***
-  // Questo ottiene il MAC address del dispositivo che ha inviato il pacchetto (il Master)
+  // CORREZIONE: Usa src_addr come suggerito dal compilatore
   const uint8_t * mac_addr = tx_info->src_addr; 
   
   if (status == ESP_NOW_SEND_SUCCESS) {
@@ -89,38 +86,47 @@ void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
     Serial.println("Packet failed to send.");
   }
 }
-//END SERVER********************************************
-
+// END SERVER CALLBACK
 
 // =======================================================
 // FUNZIONE DI MAPPATURA (LOGICA PRINCIPALE)
 // =======================================================
 /**
  * Mappa il valore analogico (0-4095) a una percentuale (-100 a +100)
- * usando un centro calibrato, arrotonda e INVERTE la direzione.
+ * usando un centro calibrato, arrotonda e INVERTE la direzione Y.
  */
-int map_to_percentage(int value, int center) {
+int map_to_percentage(int value, int center, bool invert = false) {
   
   // 1. Controllo Zona Morta (Deadzone)
   if (value >= (center - DEADZONE) && value <= (center + DEADZONE)) {
     return 0; // 0% (STOP/CENTRO)
   }
 
-  // 2. Mappatura Lineare Calibrata (LOGICA INVERTITA)
+  // 2. Mappatura Lineare Calibrata
   int raw_percentage;
   
-  if (value > center) {
-    // NUOVO: Mappa i valori sopra il centro (più alto) a 0 a -100 (Inversione)
-    raw_percentage = map(value, center, ADC_MAX, 0, -100);
+  // Per l'asse Y (Marcia), la logica è invertita (spingendo in alto il valore cresce, ma vogliamo che sia negativo)
+  if (invert) {
+      if (value > center) {
+          // Mappa i valori sopra il centro (alto) a 0 a -100 (Marcia Indietro/Freno)
+          raw_percentage = map(value, center + DEADZONE, ADC_MAX, 0, -100);
+      } else {
+          // Mappa i valori sotto il centro (basso) a +100 a 0 (Marcia Avanti/Accelerazione)
+          raw_percentage = map(value, ADC_MIN, center - DEADZONE, 100, 0); 
+      }
   } else {
-    // NUOVO: Mappa i valori sotto il centro (più basso) a +100 a 0 (Inversione)
-    raw_percentage = map(value, ADC_MIN, center, 100, 0); 
+      // Per l'asse X (Sterzo), logica standard
+      if (value > center) {
+          raw_percentage = map(value, center + DEADZONE, ADC_MAX, 0, 100); // Destra
+      } else {
+          raw_percentage = map(value, ADC_MIN, center - DEADZONE, -100, 0); // Sinistra
+      }
   }
   
   // 3. Arrotondamento al 10% più vicino
   int rounded_percentage = (int)round((float)raw_percentage / STEP_PERCENT) * STEP_PERCENT;
 
-  // Garantisce che il valore massimo non superi il 100%
+  // Garanzia dei limiti
   if (rounded_percentage > 100) return 100;
   if (rounded_percentage < -100) return -100;
 
@@ -136,45 +142,67 @@ void loop() {
   int yValue = analogRead(joyY);
   int buttonState = digitalRead(buttonPin);
 
-  // Mappa usando i CENTRI CALIBRATI
-  int yPercent = map_to_percentage(yValue, CENTER_Y_REAL);
-  int xPercent = map_to_percentage(xValue, CENTER_X_REAL);
+  // Mappa Y (Marcia) con inversione
+  int yPercent = map_to_percentage(yValue, CENTER_Y_REAL, true);
+  // Mappa X (Sterzo) senza inversione (Negativo=Sinistra, Positivo=Destra)
+  int xPercent = map_to_percentage(xValue, CENTER_X_REAL, false);
 
-  // Stampa i risultati (Cleaned-up version)
-  Serial.print("Y (Marcia): ");
-  Serial.print(yPercent);
-  Serial.print("% ("); 
-  Serial.print(yValue); 
-  Serial.print(") | X (Sterzo): ");
-  Serial.print(xPercent);
-  Serial.print("% ("); 
-  Serial.print(xValue); 
-  Serial.print(") | Bottone: ");
-  
-  if (buttonState == LOW) {
-    Serial.println("**SCHIACCIATO**");
+  // 1. DETERMINAZIONE DELLA DIREZIONE DA INVIARE
+  Direction currentDirection = INVALID_DIRECTION;
+
+  // LOGICA DI PRIORITÀ: Y (Marcia/Freno) ha la precedenza
+  if (yPercent > 0) { // Joystick tirato indietro (Marcia Avanti/Accelerazione)
+      currentDirection = NORD; 
+  } else if (yPercent < 0) { // Joystick spinto in avanti (Marcia Indietro/Freno)
+      currentDirection = SUD; 
+  } 
+  // Se Y è neutrale (0), controlla X
+  else if (xPercent > 0) { // Joystick a destra
+      currentDirection = OVEST; // Utilizzo della tua mappatura OVEST (destra)
+  } else if (xPercent < 0) { // Joystick a sinistra
+      currentDirection = EST; // Utilizzo della tua mappatura EST (sinistra)
   } else {
-    Serial.println("Rilasciato");
+      currentDirection = INVALID_DIRECTION; // Centro/Stop
   }
 
-//START SERVER********************************************
-// Calcola la direzione da inviare (cicla tra 0, 1, 2, 3)
-  Direction currentDirection = (Direction)(directionIndex % 4);
+
+  // 2. CONTROLLO E INVIO DEL MESSAGGIO
   
-  myData.direction = currentDirection;
-  
-  Serial.print("\n--- SENDING --- Direction: ");
-  Serial.println(directionNames[directionIndex % 4]);
-  
-  // Invia il messaggio
-  esp_now_send(slaveAddress, (uint8_t *) &myData, sizeof(myData));
-  
-  // Passa alla direzione successiva
-  directionIndex++;
-  
-  delay(3000); // Invia una direzione ogni 3 secondi
-//END SERVER********************************************
+  // Solo se la direzione è cambiata, invia il messaggio per non saturare la rete
+  if (currentDirection != lastSentDirection) {
+      
+      myData.direction = currentDirection;
+      
+      Serial.print("\n--- SENDING --- Direction: ");
+      Serial.print(directionNames[currentDirection]);
+      Serial.print(" (Y: ");
+      Serial.print(yPercent);
+      Serial.print(" (");
+      Serial.print(yValue);
+      Serial.print(" )");
+      Serial.print("%, X: ");
+      Serial.print(xPercent);
+      Serial.println("%)");
+      Serial.print(" (");
+      Serial.print(xValue);
+      Serial.print(" )");
+      
+      // Invia il messaggio
+      esp_now_send(slaveAddress, (uint8_t *) &myData, sizeof(myData));
+      
+      lastSentDirection = currentDirection;
+      
+  } else {
+       // Stampa i risultati (Cleaned-up version)
+        Serial.print("Y: ");
+        Serial.print(yPercent);
+        Serial.print("% | X: ");
+        Serial.print(xPercent);
+        Serial.print("% | Bottone: ");
+        if (buttonState == LOW) Serial.println("**SCHIACCIATO**");
+        else Serial.println("Rilasciato");
+  }
 
 
-  //delay(100);
+  delay(100); // Ritardo per stabilizzare la lettura e l'invio
 }
